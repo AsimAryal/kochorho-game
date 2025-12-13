@@ -1,0 +1,180 @@
+:root {
+    --pico-background-color: #0f172a;
+    /* Slate 900 */
+    --pico-color: #f8fafc;
+    /* Slate 50 */
+    --pico-primary: #d946ef;
+    /* Fuchsia 500 */
+    --pico-primary-background: #d946ef;
+    --pico-primary-hover: #c026d3;
+    /* Fuchsia 600 */
+    --pico-primary-underline: #f0abfc;
+    --pico-primary-hover-background: #c026d3;
+
+    --neon-pink: #f472b6;
+    --neon-purple: #a855f7;
+    --card-bg: #1e293b;
+    /* Slate 800 */
+}
+
+body {
+    background-color: var(--pico-background-color);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Header */
+header {
+    text-align: center;
+    padding-top: 1rem;
+    padding-bottom: 0.5rem;
+}
+
+h1 {
+    color: var(--neon-pink);
+    text-shadow: 0 0 10px var(--neon-pink);
+    font-weight: 800;
+    letter-spacing: 2px;
+}
+
+/* Containers */
+main.container {
+    max-width: 600px;
+    /* Mobile focused */
+}
+
+/* Cards */
+article {
+    background-color: var(--card-bg);
+    border: 1px solid var(--neon-purple);
+    box-shadow: 0 0 15px rgba(168, 85, 247, 0.2);
+    border-radius: 12px;
+}
+
+/* Buttons */
+button {
+    border-radius: 50px;
+    font-weight: bold;
+    text-transform: uppercase;
+    transition: transform 0.1s ease-in-out;
+}
+
+button:active {
+    transform: scale(0.95);
+}
+
+button.secondary {
+    background-color: transparent;
+    border: 2px solid var(--pico-primary);
+    color: var(--pico-primary);
+}
+
+button.red {
+    background-color: #ef4444;
+    border-color: #ef4444;
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    justify-content: center;
+    gap: 1rem;
+    margin-bottom: 2rem;
+}
+
+.tab-btn {
+    background: transparent;
+    border: none;
+    color: #64748b;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding-bottom: 0.5rem;
+    cursor: pointer;
+    font-size: 1.2rem;
+}
+
+.tab-btn.active {
+    color: var(--pico-primary);
+    border-color: var(--pico-primary);
+    text-shadow: 0 0 8px var(--pico-primary);
+}
+
+/* Helper Classes */
+.hidden {
+    display: none !important;
+}
+
+.role-card {
+    text-align: center;
+    padding: 2rem;
+    border: 2px dashed var(--neon-pink);
+    margin: 1rem 0;
+    user-select: none;
+    /* Prevent copying */
+}
+
+.word-reveal {
+    font-size: 2.5rem;
+    font-weight: bold;
+    color: #fff;
+    text-shadow: 0 0 20px var(--pico-primary);
+    margin-top: 0.5rem;
+    transition: all 0.3s ease;
+}
+
+.secret-blur {
+    /* Webkit prefix for older Android browsers */
+    -webkit-filter: blur(20px);
+    filter: blur(20px);
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    text-shadow: none;
+    /* Mobile touch improvements */
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.tap-hint {
+    font-size: 0.8rem;
+    color: #94a3b8;
+    margin-top: 5px;
+}
+
+.player-list-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem;
+    border-bottom: 1px solid #334155;
+    margin-bottom: 0.5rem;
+}
+
+.player-list-item.voted {
+    background-color: #334155;
+    border-left: 4px solid var(--neon-pink);
+}
+
+.eliminated {
+    opacity: 0.5;
+    text-decoration: line-through;
+}
+
+/* Animations */
+@keyframes pulse {
+    0% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.05);
+    }
+
+    100% {
+        transform: scale(1);
+    }
+}
+
+.pulse {
+    animation: pulse 2s infinite;
+}

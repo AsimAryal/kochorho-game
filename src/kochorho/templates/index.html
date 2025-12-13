@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KoChorHo</title>
+    <!-- Pico.css -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <h1>KoChorHo</h1>
+    </header>
+
+    <main class="container">
+        <!-- View: Onboarding (Name) -->
+        <article id="view-onboarding">
+            <header>Who are you?</header>
+            <input type="text" id="nickname-input" placeholder="Enter your nickname" maxlength="12">
+            <button onclick="saveProfile()">Continue</button>
+        </article>
+
+        <!-- View: Lobby -->
+        <div id="view-lobby" class="hidden">
+            <div class="tabs">
+                <button class="tab-btn active" id="tab-join" onclick="switchTab('join')">Join Game</button>
+                <button class="tab-btn" id="tab-host" onclick="switchTab('host')">Host Game</button>
+            </div>
+
+            <!-- Tab: Join -->
+            <div id="content-join">
+                <article>
+                    <header>Live Games</header>
+                    <div id="game-list">
+                        <small>Looking for games...</small>
+                    </div>
+                </article>
+            </div>
+
+            <!-- Tab: Host -->
+            <div id="content-host" class="hidden">
+                <article style="text-align: center;">
+                    <h3>Start a New Party</h3>
+                    <p>Create a room and invite your friends!</p>
+                    <button class="contrast" onclick="createGame()">Create Lobby</button>
+                </article>
+            </div>
+        </div>
+
+        <!-- View: Game Room -->
+        <div id="view-game" class="hidden">
+            <nav>
+                <ul><li>Room: <strong id="display-room-code" style="color:var(--neon-pink)"></strong></li></ul>
+                <ul>
+                    <li><span id="display-mode-badge" class="hidden" style="background:var(--neon-purple);padding:0.2rem 0.5rem;border-radius:4px;font-size:0.8rem;">Mystery</span></li>
+                    <li><span id="display-my-role">Loading...</span></li>
+                </ul>
+            </nav>
+
+            <!-- State: Lobby Waiting -->
+            <article id="state-lobby-waiting" class="hidden">
+                <header>Waiting for Players...</header>
+                <ul id="player-list-waiting"></ul>
+                
+                <div id="host-controls" class="hidden">
+                    <!-- Game Mode Toggle -->
+                    <div style="margin-bottom:1rem;text-align:center;">
+                        <label style="display:flex;align-items:center;justify-content:center;gap:0.5rem;cursor:pointer;">
+                            <input type="checkbox" id="mystery-mode-toggle" role="switch" onchange="toggleMysteryMode()">
+                            <span>Mystery Mode</span>
+                            <small style="color:#94a3b8;">(Nobody knows their role)</small>
+                        </label>
+                    </div>
+                    <button class="pulse" onclick="sendGameAction('start_game')">Start Game</button>
+                </div>
+                <div id="waiting-msg" class="hidden">
+                    <small>Waiting for host to start...</small>
+                    <div id="mode-display-guest" class="hidden" style="margin-top:0.5rem;">
+                        <small style="color:var(--neon-purple);">Mode: <span id="guest-mode-label">Classic</span></small>
+                    </div>
+                </div>
+            </article>
+
+            <!-- State: Round Start (Reveal) -->
+            <article id="state-round-reveal" class="hidden">
+                <header>Your Secret Word</header>
+                <div class="role-card">
+                    <small>You are a <strong id="role-text"></strong></small>
+                    <div class="word-reveal secret-blur" id="secret-word">???</div>
+                </div>
+                <button onclick="sendGameAction('next_round')" style="display:none;" id="host-next-round-btn">Next Round</button> <!-- Hidden here usually -->
+                <p>Describe your word without giving it away!</p>
+                <button class="contrast" onclick="showVotingUI()">Ready to Vote</button>
+            </article>
+
+            <!-- State: Voting -->
+            <article id="state-voting" class="hidden">
+                <header>Vote for the Imposter</header>
+                <p>Tap a player to vote them out.</p>
+                <div id="voting-buttons"></div>
+            </article>
+
+            <!-- State: Results -->
+            <article id="state-results" class="hidden">
+                <header>Round Results</header>
+                <h3 id="result-winner-text" class="hidden" style="color:var(--neon-pink)">Game Over</h3>
+                
+                <!-- Imposter Revealed Banner (Mystery Mode) -->
+                <div id="imposter-revealed-banner" class="hidden" style="background:var(--neon-pink);padding:1rem;border-radius:8px;margin-bottom:1rem;text-align:center;">
+                    <strong>🎭 Imposter Revealed!</strong>
+                    <div id="revealed-imposter-name" style="font-size:1.5rem;margin-top:0.5rem;"></div>
+                </div>
+                
+                <div id="results-feed"></div>
+                
+                <!-- Reveal Imposter Button (for eliminated players in Mystery Mode) -->
+                <div id="reveal-imposter-controls" class="hidden" style="margin-top:1rem;text-align:center;">
+                    <p style="color:#94a3b8;font-size:0.9rem;">You know who the imposter is...</p>
+                    <button class="red" onclick="sendGameAction('reveal_imposter')">🎭 Reveal Imposter to Everyone</button>
+                </div>
+                
+                <div id="game-over-controls" class="hidden">
+                    <button onclick="leaveGame()">Back to Lobby</button>
+                </div>
+                
+                <div id="next-round-controls" class="hidden">
+                    <button onclick="sendGameAction('next_round')">Next Round</button>
+                </div>
+            </article>
+            
+             <!-- Spectator Overlay handled via state/role checks essentially -->
+        </div>
+
+    </main>
+
+    <script>
+        // --- State ---
+        let nickname = localStorage.getItem('kochorho_nickname') || "";
+        let clientId = localStorage.getItem('kochorho_id');
+        let lobbyWs = null;
+        let gameWs = null;
+        let roomCode = "";
+        let isImposter = false;
+        
+        if (!clientId) {
+            clientId = 'user_' + Math.random().toString(36).substr(2, 9);
+            localStorage.setItem('kochorho_id', clientId);
+        }
+
+        // --- Init ---
+        if (nickname) {
+            document.getElementById('nickname-input').value = nickname;
+            showLobby();
+        } else {
+            console.log("No nickname saved.");
+        }
+
+        function saveProfile() {
+            nickname = document.getElementById('nickname-input').value.trim();
+            if(!nickname) return alert("Please enter a name!");
+            localStorage.setItem('kochorho_nickname', nickname);
+            showLobby();
+        }
+
+        // --- View Switching ---
+        function hideAllViews() {
+            document.getElementById('view-onboarding').classList.add('hidden');
+            document.getElementById('view-lobby').classList.add('hidden');
+            document.getElementById('view-game').classList.add('hidden');
+        }
+
+        function showLobby() {
+            hideAllViews();
+            document.getElementById('view-lobby').classList.remove('hidden');
+            connectLobbyWs();
+        }
+
+        function showGame(code) {
+            hideAllViews();
+            roomCode = code;
+            document.getElementById('display-room-code').innerText = code;
+            document.getElementById('view-game').classList.remove('hidden');
+            if(lobbyWs) lobbyWs.close(); // Disconnect lobby to save resource
+            connectGameWs(code);
+        }
+
+        function switchTab(tab) {
+            document.getElementById('tab-join').classList.remove('active');
+            document.getElementById('tab-host').classList.remove('active');
+            document.getElementById('content-join').classList.add('hidden');
+            document.getElementById('content-host').classList.add('hidden');
+
+            document.getElementById(`tab-${tab}`).classList.add('active');
+            document.getElementById(`content-${tab}`).classList.remove('hidden');
+        }
+
+        function leaveGame() {
+            if(gameWs) gameWs.close();
+            roomCode = "";
+            showLobby();
+        }
+
+        // --- WebSocket: Lobby ---
+        function connectLobbyWs() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            lobbyWs = new WebSocket(`${proto}://${window.location.host}/ws/lobby`);
+            
+            lobbyWs.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'gamelist') {
+                    renderGameList(data.games);
+                } else if (data.type === 'game_created') {
+                    showGame(data.room_code);
+                }
+            };
+        }
+
+        function createGame() {
+            lobbyWs.send(JSON.stringify({
+                type: 'create_game',
+                client_id: clientId,
+                nickname: nickname
+            }));
+        }
+
+        function renderGameList(games) {
+            const list = document.getElementById('game-list');
+            list.innerHTML = "";
+            if (games.length === 0) {
+                list.innerHTML = "<p>No games active. Create one!</p>";
+                return;
+            }
+            games.forEach(g => {
+                const div = document.createElement('div');
+                div.innerHTML = `
+                    <article style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem; padding:1rem;">
+                        <div>
+                            <strong>${g.host}'s Game</strong><br>
+                            <small>${g.count} Players - ${g.state}</small>
+                        </div>
+                        <button class="secondary" onclick="showGame('${g.code}')">Join</button>
+                    </article>
+                `;
+                list.appendChild(div);
+            });
+        }
+
+        // --- WebSocket: Game ---
+        let gameReconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 3;
+        
+        function connectGameWs(code) {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            gameWs = new WebSocket(`${proto}://${window.location.host}/ws/game/${code}/${clientId}`);
+            
+            gameWs.onopen = () => {
+                gameReconnectAttempts = 0; // Reset on successful connection
+                gameWs.send(JSON.stringify({ action: 'join', nickname: nickname }));
+            };
+
+            gameWs.onmessage = (event) => {
+                const state = JSON.parse(event.data);
+                renderGameState(state);
+            };
+            
+            gameWs.onerror = (error) => {
+                console.error('Game WebSocket error:', error);
+            };
+            
+            gameWs.onclose = (event) => {
+                // Attempt reconnection if not intentional close
+                if (event.code !== 1000 && event.code !== 4000 && gameReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    gameReconnectAttempts++;
+                    console.log(`Connection lost. Reconnecting... (attempt ${gameReconnectAttempts})`);
+                    setTimeout(() => connectGameWs(code), 1000 * gameReconnectAttempts);
+                } else if (event.code === 4000) {
+                    // Game not found
+                    alert('Game not found or has ended.');
+                    showLobby();
+                }
+            };
+        }
+
+        function sendGameAction(action, payload={}) {
+            if(!gameWs) return;
+            gameWs.send(JSON.stringify({ action: action, ...payload }));
+        }
+
+        // --- Game Render Logic ---
+        function renderGameState(state) {
+            const myPlayer = state.players.find(p => p.client_id === clientId);
+            if (!myPlayer) return; // Wait for join confirm
+
+            // Role Banner
+            const roleEl = document.getElementById('display-my-role');
+            if (state.state === 'LOBBY') {
+                roleEl.innerText = myPlayer.is_host ? "You are HOST" : "Waiting...";
+            } else if (state.my_role) {
+                roleEl.innerText = state.my_role;
+                roleEl.style.color = state.my_role === 'Imposter' ? 'var(--neon-pink)' : '#4ade80';
+            }
+
+            // Hide all sub-states first
+            document.getElementById('state-lobby-waiting').classList.add('hidden');
+            document.getElementById('state-round-reveal').classList.add('hidden');
+            document.getElementById('state-voting').classList.add('hidden');
+            document.getElementById('state-results').classList.add('hidden');
+
+            // Dispatch View
+            if (state.state === 'LOBBY') {
+                renderLobbyWaiting(state, myPlayer);
+            } else if (state.state === 'ROUND_START') {
+                renderRoundReveal(state, myPlayer);
+            } else if (state.state === 'VOTING') {
+                renderVoting(state, myPlayer);
+            } else if (state.state === 'RESULTS' || state.state === 'GAME_OVER') {
+                renderResults(state, myPlayer);
+            }
+        }
+
+        function renderLobbyWaiting(state, me) {
+            const container = document.getElementById('state-lobby-waiting');
+            container.classList.remove('hidden');
+            
+            const list = document.getElementById('player-list-waiting');
+            list.innerHTML = state.players.map(p => `<li>${p.nickname} ${p.is_host ? '(Host)' : ''}</li>`).join('');
+
+            if (me.is_host) {
+                document.getElementById('host-controls').classList.remove('hidden');
+                document.getElementById('waiting-msg').classList.add('hidden');
+                // Sync mystery mode toggle with server state
+                document.getElementById('mystery-mode-toggle').checked = state.mystery_mode;
+            } else {
+                document.getElementById('host-controls').classList.add('hidden');
+                document.getElementById('waiting-msg').classList.remove('hidden');
+                // Show mode to guests
+                document.getElementById('mode-display-guest').classList.remove('hidden');
+                document.getElementById('guest-mode-label').innerText = state.mystery_mode ? 'Mystery' : 'Classic';
+            }
+            
+            // Show/hide mystery badge in nav
+            const badge = document.getElementById('display-mode-badge');
+            if (state.mystery_mode) {
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+        
+        function toggleMysteryMode() {
+            const enabled = document.getElementById('mystery-mode-toggle').checked;
+            sendGameAction('set_mystery_mode', { enabled: enabled });
+        }
+
+        function renderRoundReveal(state, me) {
+            const container = document.getElementById('state-round-reveal');
+            container.classList.remove('hidden');
+            
+            document.getElementById('role-text').innerText = state.my_role;
+            const wordEl = document.getElementById('secret-word');
+            
+            // Always update the word content
+            wordEl.innerText = state.my_word;
+            
+            // Remove old event handlers by cloning
+            const newWordEl = wordEl.cloneNode(true);
+            wordEl.parentNode.replaceChild(newWordEl, wordEl);
+            
+            // Re-get the element after replacement
+            const freshWordEl = document.getElementById('secret-word');
+            
+            // Apply blur using inline styles for maximum mobile compatibility
+            function applyBlur(el) {
+                el.style.filter = 'blur(20px)';
+                el.style.webkitFilter = 'blur(20px)';
+                el.style.background = 'rgba(255, 255, 255, 0.1)';
+                el.classList.add('secret-blur');
+            }
+            
+            function removeBlur(el) {
+                el.style.filter = 'none';
+                el.style.webkitFilter = 'none';
+                el.style.background = 'transparent';
+                el.classList.remove('secret-blur');
+            }
+            
+            // Start blurred
+            applyBlur(freshWordEl);
+            let isBlurred = true;
+            
+            // Toggle function for reveal/hide
+            function toggleReveal(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (isBlurred) {
+                    removeBlur(freshWordEl);
+                    isBlurred = false;
+                } else {
+                    applyBlur(freshWordEl);
+                    isBlurred = true;
+                }
+            }
+            
+            // Add both click and touch events for cross-device support
+            freshWordEl.addEventListener('click', toggleReveal);
+            freshWordEl.addEventListener('touchend', toggleReveal);
+            
+            // Make it obvious it's tappable
+            freshWordEl.style.cursor = 'pointer';
+            freshWordEl.style.webkitTapHighlightColor = 'transparent';
+            freshWordEl.style.touchAction = 'manipulation';
+            
+            // Add hint only if not already present
+            let hint = document.getElementById('tap-hint');
+            if (!hint) {
+                hint = document.createElement('div');
+                hint.id = 'tap-hint';
+                hint.className = 'tap-hint';
+                hint.innerText = "(Tap to reveal/hide)";
+                freshWordEl.parentNode.appendChild(hint);
+            }
+            
+            const btn = document.querySelector("#state-round-reveal button.contrast");
+            if (me.is_host) {
+                btn.style.display = 'block';
+                btn.innerText = "Start Voting Phase";
+                btn.onclick = function() { sendGameAction('start_voting'); };
+            } else {
+                btn.style.display = 'none';
+            }
+        }
+        
+        function showVotingUI(){
+             // Only Host calls this effectively via the HTML button, 
+             // but we override it in renderRoundReveal anyway.
+             sendGameAction('start_voting');
+        }
+
+        function renderVoting(state, me) {
+            const container = document.getElementById('state-voting');
+            container.classList.remove('hidden');
+            
+            // Generate Buttons for all ALIVE players excluding SELF? 
+            // Actually you can vote for yourself in some games, but usually not.
+            // Assuming can vote anyone.
+            
+            const btnContainer = document.getElementById('voting-buttons');
+            btnContainer.innerHTML = "";
+            
+            if (!me.is_alive) {
+                btnContainer.innerHTML = "<p>You are eliminated. Watch the chaos.</p>";
+                return;
+            }
+            
+            if (me.voted_for) {
+                const target = state.players.find(p => p.client_id === me.voted_for);
+                btnContainer.innerHTML = `<p>You voted for <strong>${target ? target.nickname : 'Unknown'}</strong>. Waiting for others...</p>`;
+                return;
+            }
+
+            state.players.forEach(p => {
+                if (p.is_alive && p.client_id !== clientId) {
+                     const btn = document.createElement('button');
+                     btn.innerText = `Vote: ${p.nickname}`;
+                     btn.style.margin = "0.5rem";
+                     btn.onclick = () => sendGameAction('vote', { target_id: p.client_id });
+                     btnContainer.appendChild(btn);
+                }
+            });
+        }
+
+        function renderResults(state, me) {
+            const container = document.getElementById('state-results');
+            container.classList.remove('hidden');
+            
+            // Reset controls visibility
+            document.getElementById('reveal-imposter-controls').classList.add('hidden');
+            document.getElementById('imposter-revealed-banner').classList.add('hidden');
+            
+            // Winner?
+            const winnerText = document.getElementById('result-winner-text');
+            if (state.winner) {
+                winnerText.innerText = `${state.winner} WIN!`;
+                winnerText.classList.remove('hidden');
+                document.getElementById('game-over-controls').classList.remove('hidden');
+                document.getElementById('next-round-controls').classList.add('hidden');
+            } else {
+                winnerText.classList.add('hidden');
+                document.getElementById('game-over-controls').classList.add('hidden');
+                if (me.is_host) {
+                    document.getElementById('next-round-controls').classList.remove('hidden');
+                } else {
+                    document.getElementById('next-round-controls').classList.add('hidden');
+                }
+            }
+            
+            // Mystery Mode: Show reveal button for eliminated players who haven't revealed yet
+            if (state.mystery_mode && !me.is_alive && state.can_reveal_imposter && !state.has_revealed) {
+                document.getElementById('reveal-imposter-controls').classList.remove('hidden');
+            }
+            
+            // Show imposter to THIS player only if they revealed (per-player reveal)
+            if (state.has_revealed && state.imposter_identity) {
+                document.getElementById('imposter-revealed-banner').classList.remove('hidden');
+                document.getElementById('revealed-imposter-name').innerText = state.imposter_identity;
+            }
+            
+            // Feed
+            const feed = document.getElementById('results-feed');
+            let html = "<h4>Player Status</h4><ul>";
+            state.players.forEach(p => {
+                const isImposter = state.imposter_identity === p.nickname;
+                // Show imposter tag only at game over OR if this player has revealed
+                const showImposterTag = (state.winner || state.has_revealed) && isImposter;
+                html += `<li class="${!p.is_alive ? 'eliminated' : ''}">
+                    ${p.nickname} 
+                    ${showImposterTag ? ' <span style="color:var(--neon-pink)">(IMPOSTER)</span>' : ''}
+                    ${!p.is_alive ? '(Eliminated)' : ''}
+                 </li>`;
+            });
+            html += "</ul>";
+            feed.innerHTML = html;
+        }
+
+    </script>
+</body>
+</html>
