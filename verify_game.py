@@ -1,127 +1,168 @@
+"""End-to-end smoke test. Start the server first:
+
+    uv run uvicorn kochorho.main:app --app-dir src --port 8001
+
+then run:  uv run python verify_game.py
+"""
 import asyncio
-import websockets
 import json
 import sys
 
-# Constants
+import websockets
+
 URI = "ws://localhost:8001"
 
-async def connect_client(name):
-    """Simulates a client connecting to lobby and then game."""
-    try:
-        async with websockets.connect(f"{URI}/ws/lobby") as ws_lobby:
-            print(f"[{name}] Connected to Lobby")
-            return ws_lobby
-    except Exception as e:
-        print(f"[{name}] Failed to connect: {e}")
-        return None
 
-async def run_test():
-    async with websockets.connect(f"{URI}/ws/lobby") as ws_lobby_host:
-        print("[Host] Connected to Lobby")
-        
-        # 1. Create Game
-        host_id = "host1"
-        await ws_lobby_host.send(json.dumps({
-            "type": "create_game", 
-            "client_id": host_id, 
-            "nickname": "Host"
-        }))
-        
-        while True:
-            resp = await ws_lobby_host.recv()
-            data = json.loads(resp)
-            if data.get("type") == "game_created":
-                break
-            if data.get("type") == "gamelist":
-                continue # Ignore updates
-            
-        room_code = data["room_code"]
-        print(f"[Host] Game Created: {room_code}")
-        
-        # 2. Connect Players to Game
-        players = []
-        for i, role in enumerate(["Host", "Player2", "Player3"]):
-             pid = f"p{i}"
-             ws = await websockets.connect(f"{URI}/ws/game/{room_code}/{pid}")
-             await ws.send(json.dumps({"action": "join", "nickname": role}))
-             players.append({"ws": ws, "id": pid, "name": role, "role": None})
-             print(f"[{role}] Joined Game")
-             
-             # Consume initial state
-             state = json.loads(await ws.recv())
-             # print(f"[{role}] State: {state['state']}")
+class Client:
+    """A fake player that keeps the most recent game state it received."""
 
-        # 3. Start Game
-        print("[Host] Starting Game...")
-        await players[0]["ws"].send(json.dumps({"action": "start_game"}))
-        
-        # Verify State chagne to ROUND_START
-        imposter_found = False
-        civilian_found = False
-        
-        for p in players:
-             while True:
-                 state = json.loads(await p["ws"].recv())
-                 print(f"[{p['name']}] Received State: {state['state']}")
-                 if state['state'] == "ROUND_START":
-                     break
-                 # If we get LOBBY, just continue (stale)
-                 
-             if state['my_role'] == 'Imposter': imposter_found = True
-             if state['my_role'] == 'Civilian': civilian_found = True
-             p["role"] = state["my_role"]
-             print(f"   -> Role: {state['my_role']}, Word: {state['my_word']}")
-        
-        if not (imposter_found and civilian_found):
-             print("ERROR: Roles not assigned correctly!")
-             return
+    def __init__(self, cid: str, name: str):
+        self.cid, self.name = cid, name
+        self.ws = None
+        self.state = None
+        self.errors = []
+        self._reader = None
+        self._updated = asyncio.Event()
 
-        # 4. Start Voting
-        print("[Host] Starting Voting Phase...")
-        await players[0]["ws"].send(json.dumps({"action": "start_voting"}))
-        
-        for p in players:
-            state = json.loads(await p["ws"].recv())
-            # print(f"[{p['name']}] Voting State: {state['state']}")
+    async def join(self, code: str):
+        self.state = None  # Don't trust anything from a previous connection
+        self.ws = await websockets.connect(f"{URI}/ws/game/{code}/{self.cid}")
+        self._reader = asyncio.create_task(self._read())
+        await self.send("join", nickname=self.name)
+        await self.wait_for(lambda s: any(p["client_id"] == self.cid for p in s["players"]))
 
-        # 5. Vote (Vote out Player 2 arbitrarily)
-        target = players[1]["id"] 
-        print(f"Voting for {players[1]['name']} ({target})...")
-        
-        for p in players:
-            await p["ws"].send(json.dumps({"action": "vote", "target_id": target}))
-            # Consume broadcast after each vote
-            # Wait, 3 votes means 3 broadcasts? 
-            # Logic: cast_vote -> broadcast.
-            # So each player receives updates. We might get multiple.
-            # Just drain queue slightly or wait for final result?
+    async def _read(self):
+        try:
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                if msg.get("type") == "error":
+                    self.errors.append(msg["message"])
+                else:
+                    self.state = msg
+                self._updated.set()
+        except websockets.ConnectionClosed:
             pass
 
-        # Check Results
-        # Eventually we should get state RESULTS
-        await asyncio.sleep(0.5)
-        # Flush messages
-        final_state = None
-        for p in players:
-            while True:
-                try:
-                    msg = await asyncio.wait_for(p["ws"].recv(), timeout=0.2)
-                    state = json.loads(msg)
-                    if state['state'] == 'RESULTS' or state['state'] == 'GAME_OVER':
-                        final_state = state
-                except asyncio.TimeoutError:
-                    break
-        
-        if final_state:
-            print(f"Final State: {final_state['state']}")
-            print(f"Winner: {final_state.get('winner')}")
-        else:
-            print("Did not reach RESULTS state.")
+    async def send(self, action: str, **payload):
+        await self.ws.send(json.dumps({"action": action, **payload}))
+
+    async def wait_for(self, predicate, timeout: float = 3.0):
+        async def _loop():
+            while not (self.state and predicate(self.state)):
+                self._updated.clear()
+                await self._updated.wait()
+            return self.state
+        return await asyncio.wait_for(_loop(), timeout)
+
+    async def close(self):
+        if self.ws:
+            await self.ws.close()
+        if self._reader:
+            await asyncio.gather(self._reader, return_exceptions=True)
+
+
+def check(condition, message):
+    if not condition:
+        raise AssertionError(message)
+    print(f"  ✓ {message}")
+
+
+async def create_room() -> str:
+    async with websockets.connect(f"{URI}/ws/lobby") as lobby:
+        await lobby.send(json.dumps({"type": "create_game"}))
+        while True:
+            data = json.loads(await lobby.recv())
+            if data.get("type") == "game_created":
+                return data["room_code"]
+
+
+async def run_test():
+    code = await create_room()
+    print(f"Room {code}")
+
+    host = Client("host1", "Host")
+    p2 = Client("p2", "<img src=x onerror=alert(1)> very long name")
+    p3 = Client("p3", "Player3")
+    clients = [host, p2, p3]
+
+    await host.join(code)
+    check(host.state["players"][0]["is_host"], "first player to join becomes host")
+    await p2.join(code)
+    await p3.join(code)
+    await host.wait_for(lambda s: len(s["players"]) == 3)
+    check(len(next(p for p in host.state["players"] if p["client_id"] == "p2")["nickname"]) <= 16,
+          "nicknames are length-capped")
+
+    # Only the host can start
+    await p2.send("start_game")
+    await asyncio.sleep(0.2)
+    check(p2.state["state"] == "LOBBY" and p2.errors, "non-host cannot start the game")
+
+    await host.send("start_game")
+    for c in clients:
+        await c.wait_for(lambda s: s["state"] == "ROUND_START")
+    roles = {c.cid: c.state["my_role"] for c in clients}
+    check(list(roles.values()).count("Imposter") == 1, "exactly one imposter assigned")
+    imposter = next(c for c in clients if roles[c.cid] == "Imposter")
+    civilians = [c for c in clients if c is not imposter]
+    word_before = imposter.state["my_word"]
+
+    # Late joiners are turned away mid-game
+    late = await websockets.connect(f"{URI}/ws/game/{code}/late")
+    await late.send(json.dumps({"action": "join", "nickname": "Late"}))
+    try:
+        await asyncio.wait_for(late.recv(), 2)
+        check(False, "late joiner should be rejected")
+    except websockets.ConnectionClosed as e:
+        check(e.rcvd.code == 4001, "late joiner rejected with 4001")
+
+    # Imposter drops (phone locks) and comes back - must keep their role and word
+    await imposter.close()
+    await civilians[0].wait_for(lambda s: any(p["client_id"] == imposter.cid and not p["is_connected"] for p in s["players"]))
+    check(True, "disconnected player keeps their seat mid-game")
+    await imposter.join(code)
+    await imposter.wait_for(lambda s: s["state"] == "ROUND_START")
+    check(imposter.state["my_role"] == "Imposter" and imposter.state["my_word"] == word_before,
+          "reconnecting imposter keeps role and word")
+
+    # Host duties may have migrated if the host was the one who dropped
+    host_row = next(p for p in imposter.state["players"] if p["is_host"])
+    check(host_row["is_connected"], "host role is always held by an online player")
+    host = next(c for c in clients if c.cid == host_row["client_id"])
+
+    # Voting
+    await host.send("start_voting")
+    for c in clients:
+        await c.wait_for(lambda s: s["state"] == "VOTING")
+    check(all("voted_for" not in p for p in host.state["players"]), "individual votes are private")
+
+    await civilians[0].send("vote", target_id=civilians[0].cid)  # self-vote is invalid
+    await asyncio.sleep(0.2)
+    check(civilians[0].errors, "self-votes are rejected")
+
+    for c in clients:
+        target = imposter.cid if c is not imposter else civilians[0].cid
+        await c.send("vote", target_id=target)
+
+    final = await host.wait_for(lambda s: s["state"] == "GAME_OVER")
+    check(final["winner"] == "Civilians", "voting out the imposter -> Civilians win")
+    check(final["last_result"]["eliminated_id"] == imposter.cid, "results report who was eliminated")
+    check(final["words"]["imposter"] == word_before, "both words revealed at game over")
+
+    # Play again keeps the room together
+    await host.send("return_to_lobby")
+    for c in clients:
+        await c.wait_for(lambda s: s["state"] == "LOBBY")
+    check(all(p["is_alive"] for p in host.state["players"]), "play again resets the room to the lobby")
+
+    for c in clients:
+        await c.close()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(run_test())
-        print("Test Complete")
+        print("All checks passed")
     except Exception as e:
-        print(f"Test Failed: {e}")
+        print(f"Test Failed: {type(e).__name__}: {e}")
+        sys.exit(1)
