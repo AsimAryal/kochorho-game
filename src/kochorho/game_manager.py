@@ -1,11 +1,19 @@
 import random
-import string
 import asyncio
-from typing import Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # --- Data Models & Constants ---
+
+MIN_PLAYERS = 3
+MAX_NICKNAME_LENGTH = 16
+EMPTY_GAME_GRACE_SECONDS = 60  # How long an empty room survives (lets people refresh / reconnect)
+ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # No I / O to avoid confusion with 1 / 0
+
 
 class GameState(Enum):
     LOBBY = "LOBBY"
@@ -14,6 +22,16 @@ class GameState(Enum):
     RESULTS = "RESULTS" # Show who was eliminated
     GAME_OVER = "GAME_OVER"
 
+
+ACTIVE_ROUND_STATES = (GameState.ROUND_START, GameState.VOTING, GameState.RESULTS)
+
+
+def sanitize_nickname(raw: Any) -> str:
+    """Trim, collapse whitespace and cap the length of a nickname."""
+    name = " ".join(str(raw or "").split())[:MAX_NICKNAME_LENGTH]
+    return name or "Player"
+
+
 @dataclass
 class Player:
     client_id: str
@@ -21,18 +39,25 @@ class Player:
     is_host: bool = False
     is_imposter: bool = False
     is_alive: bool = True
-    websocket: any = None  # WebSocket object
+    websocket: Any = None  # WebSocket object (None while disconnected)
     voted_for: Optional[str] = None  # client_id of who they voted for
     has_seen_imposter: bool = False  # Mystery Mode: has this player revealed the imposter for themselves?
 
+    @property
+    def is_connected(self) -> bool:
+        return self.websocket is not None
+
     def to_dict(self):
+        # NOTE: who voted for whom stays private until the results are in.
         return {
             "client_id": self.client_id,
             "nickname": self.nickname,
             "is_host": self.is_host,
             "is_alive": self.is_alive,
-            "voted_for": self.voted_for
+            "is_connected": self.is_connected,
+            "has_voted": self.voted_for is not None,
         }
+
 
 class WordBank:
     """Manages the dictionary of word pairs."""
@@ -58,7 +83,67 @@ class WordBank:
             ("Facebook", "Twitter"),
             ("iPhone", "Android"),
             ("Doctor", "Nurse"),
-            ("King", "Prince")
+            ("King", "Prince"),
+            ("Beach", "Desert"),
+            ("Snow", "Rain"),
+            ("Cat", "Fox"),
+            ("Football", "Rugby"),
+            ("Tennis", "Badminton"),
+            ("Wine", "Beer"),
+            ("Chocolate", "Caramel"),
+            ("Pancake", "Waffle"),
+            ("Sushi", "Ramen"),
+            ("Mountain", "Volcano"),
+            ("River", "Waterfall"),
+            ("Castle", "Palace"),
+            ("Pirate", "Ninja"),
+            ("Vampire", "Zombie"),
+            ("Wizard", "Witch"),
+            ("Dragon", "Dinosaur"),
+            ("Rocket", "Aeroplane"),
+            ("Bicycle", "Scooter"),
+            ("Hospital", "Pharmacy"),
+            ("Library", "Bookshop"),
+            ("Cinema", "Theatre"),
+            ("Netflix", "YouTube"),
+            ("Instagram", "TikTok"),
+            ("Laptop", "Tablet"),
+            ("Camera", "Telescope"),
+            ("Umbrella", "Raincoat"),
+            ("Pillow", "Blanket"),
+            ("Shower", "Bath"),
+            ("Fork", "Spoon"),
+            ("Salt", "Sugar"),
+            ("Ketchup", "Mustard"),
+            ("Orange", "Lemon"),
+            ("Strawberry", "Cherry"),
+            ("Banana", "Mango"),
+            ("Ice Cream", "Frozen Yoghurt"),
+            ("Birthday", "Wedding"),
+            ("Christmas", "Halloween"),
+            ("Teacher", "Professor"),
+            ("Police", "Firefighter"),
+            ("Chef", "Waiter"),
+            ("Dentist", "Barber"),
+            ("Shark", "Dolphin"),
+            ("Eagle", "Owl"),
+            ("Bee", "Wasp"),
+            ("Spider", "Scorpion"),
+            ("Rose", "Tulip"),
+            ("Guitar", "Violin"),
+            ("Drum", "Tambourine"),
+            ("Harry Potter", "Lord of the Rings"),
+            ("Mario", "Sonic"),
+            ("Chess", "Draughts"),
+            ("Karaoke", "Disco"),
+            ("Gym", "Yoga"),
+            ("Passport", "Ticket"),
+            ("Hotel", "Hostel"),
+            ("Diamond", "Pearl"),
+            ("Clock", "Watch"),
+            ("Mirror", "Window"),
+            ("Candle", "Torch"),
+            ("Ghost", "Alien"),
         ]
         self.used_indices = set()
 
@@ -69,7 +154,7 @@ class WordBank:
         if not available_indices:
             self.used_indices = set()
             available_indices = set(range(len(self.pairs)))
-        
+
         idx = random.choice(list(available_indices))
         self.used_indices.add(idx)
         pair = self.pairs[idx]
@@ -81,232 +166,357 @@ class WordBank:
 # --- Game Logic ---
 
 class GameInstance:
-    def __init__(self, room_code: str, host_id: str, host_name: str, host_ws):
+    def __init__(self, room_code: str):
         self.room_code = room_code
         self.players: Dict[str, Player] = {}
         self.state = GameState.LOBBY
         self.word_bank = WordBank()
-        
+        # Serialises all actions for this room so concurrent messages can't interleave mid-update.
+        self.lock = asyncio.Lock()
+
         # Game Settings
         self.mystery_mode: bool = False  # If True, players don't see their role
-        
+
         # Round State
+        self.round_number = 0
         self.current_majority_word = ""
         self.current_imposter_word = ""
         self.imposter_id: Optional[str] = None
         self.winner: Optional[str] = None  # "Civilians" or "Imposter"
+        self.last_result: Optional[dict] = None  # Outcome of the most recent vote
 
-        # Add Host
-        self.add_player(host_id, host_name, host_ws, is_host=True)
+    # --- Player helpers ---
 
-    def add_player(self, client_id: str, nickname: str, websocket, is_host: bool = False):
-        if client_id in self.players:
-            # Reconnection logic could go here, for now just update WS
-            self.players[client_id].websocket = websocket
-            # If name changed? 
-            self.players[client_id].nickname = nickname 
-        else:
-            self.players[client_id] = Player(
-                client_id=client_id, 
-                nickname=nickname, 
-                websocket=websocket, 
-                is_host=is_host
-            )
+    def connected_players(self) -> List[Player]:
+        return [p for p in self.players.values() if p.is_connected]
 
-    def remove_player(self, client_id: str):
-        if client_id not in self.players:
-            return
-        
-        was_host = self.players[client_id].is_host
-        del self.players[client_id]
-        
-        # Host migration: assign new host to first remaining player
-        if was_host and self.players:
-            first_player_id = list(self.players.keys())[0]
-            self.players[first_player_id].is_host = True
-    
-    async def broadcast_state(self):
-        """Sends the current full state to all connected clients."""
-        state_data = self.get_state_data()
-        for p in self.players.values():
-            if p.websocket:
-                try:
-                    # Customize data for sender (e.g. show words only if round active)
-                    player_specific_data = self.enrich_state_for_player(state_data, p)
-                    await p.websocket.send_json(player_specific_data)
-                except Exception:
-                    pass # Handle disconnects elsewhere
+    def alive_players(self) -> List[Player]:
+        return [p for p in self.players.values() if p.is_alive]
 
-    def enrich_state_for_player(self, base_data, player: Player):
-        """Adds private info like 'your_word' based on role."""
-        data = base_data.copy()
-        data["my_id"] = player.client_id
-        
-        if self.state in [GameState.ROUND_START, GameState.VOTING, GameState.RESULTS]:
-            if player.is_alive:
-                if player.is_imposter:
-                    data["my_word"] = self.current_imposter_word
-                    # In Mystery Mode, don't reveal role to alive players
-                    if self.mystery_mode:
-                        data["my_role"] = "???"
-                    else:
-                        data["my_role"] = "Imposter"
-                else:
-                    data["my_word"] = self.current_majority_word
-                    if self.mystery_mode:
-                        data["my_role"] = "???"
-                    else:
-                        data["my_role"] = "Civilian"
-            else:
-                # Eliminated players
-                data["my_word"] = "ELIMINATED"
-                data["my_role"] = "Spectator"
-                # In Mystery Mode, eliminated players can reveal imposter for themselves
-                if self.mystery_mode:
-                    if player.has_seen_imposter:
-                        # Player has already revealed - show them the imposter
-                        data["imposter_identity"] = self.get_player_name(self.imposter_id)
-                        data["has_revealed"] = True
-                    else:
-                        # Show "Reveal" button option
-                        data["can_reveal_imposter"] = True
-        
-        # In game over, reveal everything to everyone
-        if self.state == GameState.GAME_OVER:
-            data["imposter_identity"] = self.get_player_name(self.imposter_id)
+    def host(self) -> Optional[Player]:
+        return next((p for p in self.players.values() if p.is_host), None)
 
-        return data
-
-    def get_state_data(self):
-        return {
-            "room_code": self.room_code,
-            "state": self.state.value,
-            "players": [p.to_dict() for p in self.players.values()],
-            "winner": self.winner,
-            "mystery_mode": self.mystery_mode
-        }
+    def is_host(self, client_id: str) -> bool:
+        p = self.players.get(client_id)
+        return bool(p and p.is_host)
 
     def get_player_name(self, client_id):
         return self.players[client_id].nickname if client_id in self.players else "Unknown"
 
-    # --- Actions ---
+    def ensure_host(self):
+        """Make sure a *connected* player holds the host role, so the game never stalls."""
+        current = self.host()
+        if current and current.is_connected:
+            return
+        candidate = next((p for p in self.players.values() if p.is_connected), None)
+        if candidate is None:
+            return  # Nobody online; keep the current host flag until someone returns
+        if current:
+            current.is_host = False
+        candidate.is_host = True
 
-    async def start_game(self):
-        if len(self.players) < 3:
-            return False, "Need at least 3 players."
-        
+    def can_join(self, client_id: str) -> tuple[bool, str]:
+        if client_id in self.players:
+            return True, ""  # Reconnecting player keeps their seat
+        if self.state == GameState.LOBBY:
+            return True, ""
+        return False, "That game is already in progress."
+
+    def add_player(self, client_id: str, nickname: str, websocket):
+        """Adds a new player, or re-attaches a returning player to a new socket."""
+        player = self.players.get(client_id)
+        if player:
+            player.websocket = websocket
+            player.nickname = nickname
+        else:
+            self.players[client_id] = Player(
+                client_id=client_id,
+                nickname=nickname,
+                websocket=websocket,
+            )
+        self.ensure_host()
+
+    async def handle_disconnect(self, client_id: str, websocket) -> bool:
+        """Called when a socket closes. Returns True if the game state changed."""
+        player = self.players.get(client_id)
+        # Ignore stale sockets (e.g. the player already reconnected from a refreshed tab)
+        if not player or player.websocket is not websocket:
+            return False
+
+        if self.state == GameState.LOBBY:
+            del self.players[client_id]
+        else:
+            # Mid-game we keep their seat (role, alive status, vote) so they can come back.
+            player.websocket = None
+
+        self.ensure_host()
+        await self.maybe_resolve_votes()
+        return True
+
+    # --- State serialisation ---
+
+    async def broadcast_state(self):
+        """Sends the current full state to all connected clients."""
+        state_data = self.get_state_data()
+        for p in list(self.players.values()):
+            if p.websocket:
+                try:
+                    await p.websocket.send_json(self.enrich_state_for_player(state_data, p))
+                except Exception:
+                    pass  # Disconnects are handled by the socket's own handler
+
+    def state_for(self, player: Player) -> dict:
+        return self.enrich_state_for_player(self.get_state_data(), player)
+
+    def enrich_state_for_player(self, base_data, player: Player):
+        """Adds private info like 'my_word' based on role."""
+        data = dict(base_data)
+        data["type"] = "state"
+        data["my_id"] = player.client_id
+
+        if self.state in ACTIVE_ROUND_STATES:
+            data["my_vote"] = player.voted_for
+            if player.is_alive:
+                if player.is_imposter:
+                    data["my_word"] = self.current_imposter_word
+                    real_role = "Imposter"
+                else:
+                    data["my_word"] = self.current_majority_word
+                    real_role = "Civilian"
+                # In Mystery Mode, don't reveal role to alive players
+                data["my_role"] = "???" if self.mystery_mode else real_role
+            else:
+                # Eliminated players
+                data["my_word"] = None
+                data["my_role"] = "Spectator"
+                # In Mystery Mode, eliminated players can reveal imposter for themselves
+                if self.mystery_mode:
+                    if player.has_seen_imposter:
+                        data["imposter_identity"] = self.get_player_name(self.imposter_id)
+                        data["imposter_id"] = self.imposter_id
+                        data["has_revealed"] = True
+                    else:
+                        data["can_reveal_imposter"] = True
+
+        # In game over, reveal everything to everyone
+        if self.state == GameState.GAME_OVER:
+            data["imposter_identity"] = self.get_player_name(self.imposter_id)
+            data["imposter_id"] = self.imposter_id
+            data["my_role"] = "Imposter" if player.is_imposter else "Civilian"
+            data["words"] = {
+                "civilian": self.current_majority_word,
+                "imposter": self.current_imposter_word,
+            }
+
+        return data
+
+    def get_state_data(self):
+        data = {
+            "room_code": self.room_code,
+            "state": self.state.value,
+            "players": [p.to_dict() for p in self.players.values()],
+            "winner": self.winner,
+            "mystery_mode": self.mystery_mode,
+            "round_number": self.round_number,
+            "min_players": MIN_PLAYERS,
+        }
+        if self.state == GameState.VOTING:
+            voters = self._eligible_voters()
+            data["votes_cast"] = sum(1 for p in voters if p.voted_for)
+            data["votes_needed"] = len(voters)
+        if self.state in (GameState.RESULTS, GameState.GAME_OVER):
+            data["last_result"] = self.last_result
+        return data
+
+    # --- Actions (each returns an error message, or None on success) ---
+
+    async def start_game(self, actor_id: str) -> Optional[str]:
+        if not self.is_host(actor_id):
+            return "Only the host can start the game."
+        if self.state != GameState.LOBBY:
+            return "The game has already started."
+        candidates = self.connected_players()
+        if len(candidates) < MIN_PLAYERS:
+            return f"You need at least {MIN_PLAYERS} players to start."
+
         # Assign Roles (Persists for whole game)
-        player_ids = list(self.players.keys())
-        self.imposter_id = random.choice(player_ids)
-        
+        self.imposter_id = random.choice([p.client_id for p in candidates])
         for pid, p in self.players.items():
             p.is_imposter = (pid == self.imposter_id)
             p.is_alive = True
             p.voted_for = None
-            
+            p.has_seen_imposter = False
+
         self.winner = None
-        self.word_bank.used_indices = set() # Reset word bank usage for new game? Or keep history?
-        # Requirement: "Imposter person remains the same". 
-        # Requirement: "A new Word Pair is chosen every round".
-        
+        self.round_number = 0
+        self.last_result = None
+        # Word bank history is kept across games in the same room so pairs don't repeat;
+        # it resets itself once every pair has been used.
         await self.start_round()
-        return True, "Game Started"
+        return None
 
     async def start_round(self):
         majority, imposter = self.word_bank.get_pair()
         self.current_majority_word = majority
         self.current_imposter_word = imposter
-        
-        # Reset votes logic if needed (votes are per round)
+        self.round_number += 1
+        self.last_result = None
+
+        # Votes are per round
         for p in self.players.values():
             p.voted_for = None
-            
+
         self.state = GameState.ROUND_START
         await self.broadcast_state()
 
-    async def start_voting(self):
+    async def start_voting(self, actor_id: str) -> Optional[str]:
+        if not self.is_host(actor_id):
+            return "Only the host can start voting."
+        if self.state != GameState.ROUND_START:
+            return None
         self.state = GameState.VOTING
         await self.broadcast_state()
+        return None
 
-    async def cast_vote(self, voter_id: str, target_id: str):
+    def _eligible_voters(self) -> List[Player]:
+        """Alive players who are currently online; we don't wait on people who dropped out."""
+        return [p for p in self.alive_players() if p.is_connected]
+
+    async def cast_vote(self, voter_id: str, target_id: Any) -> Optional[str]:
         if self.state != GameState.VOTING:
-            return
-        
+            return None
+
         voter = self.players.get(voter_id)
         if not voter or not voter.is_alive:
-            return
+            return "Eliminated players can't vote."
+
+        target = self.players.get(target_id) if isinstance(target_id, str) else None
+        if not target or not target.is_alive or target_id == voter_id:
+            return "That's not a valid vote."
 
         voter.voted_for = target_id
         await self.broadcast_state()
+        await self.maybe_resolve_votes()
+        return None
 
-        # Check if everyone voted
-        alive_players = [p for p in self.players.values() if p.is_alive]
-        total_votes = sum(1 for p in alive_players if p.voted_for is not None)
-        
-        if total_votes == len(alive_players):
+    async def maybe_resolve_votes(self):
+        """Resolve once every online, alive player has voted."""
+        if self.state != GameState.VOTING:
+            return
+        voters = self._eligible_voters()
+        if voters and all(p.voted_for for p in voters):
             await self.resolve_votes()
 
+    async def force_resolve(self, actor_id: str) -> Optional[str]:
+        """Host escape hatch for an AFK player holding up the vote."""
+        if not self.is_host(actor_id):
+            return "Only the host can close voting."
+        if self.state != GameState.VOTING:
+            return None
+        if not any(p.voted_for for p in self.alive_players()):
+            return "Nobody has voted yet."
+        await self.resolve_votes()
+        return None
+
     async def resolve_votes(self):
-        # Tally votes
-        vote_counts = {}
-        for p in self.players.values():
-            if p.is_alive and p.voted_for:
-                vote_counts[p.voted_for] = vote_counts.get(p.voted_for, 0) + 1
-        
-        if not vote_counts:
-            # Should not happen if we waited for all votes
-            return
+        # Tally votes (only from alive players, only for alive targets)
+        vote_counts: Dict[str, int] = {}
+        for p in self.alive_players():
+            target = self.players.get(p.voted_for) if p.voted_for else None
+            if target and target.is_alive:
+                vote_counts[target.client_id] = vote_counts.get(target.client_id, 0) + 1
 
-        # Find max votes
-        max_votes = max(vote_counts.values())
-        candidates = [pid for pid, count in vote_counts.items() if count == max_votes]
-        
         eliminated_id = None
-        
-        if len(candidates) == 1:
-            # Strict majority
-            eliminated_id = candidates[0]
-            self.players[eliminated_id].is_alive = False
-        else:
-            # Tie - No elimination per plan
-            pass 
+        if vote_counts:
+            max_votes = max(vote_counts.values())
+            candidates = [pid for pid, count in vote_counts.items() if count == max_votes]
+            if len(candidates) == 1:
+                # Strict plurality; a tie means no elimination
+                eliminated_id = candidates[0]
+                self.players[eliminated_id].is_alive = False
 
-        self.state = GameState.RESULTS
+        tally = sorted(
+            (
+                {"client_id": pid, "nickname": self.get_player_name(pid), "votes": count}
+                for pid, count in vote_counts.items()
+            ),
+            key=lambda row: row["votes"],
+            reverse=True,
+        )
+        self.last_result = {
+            "eliminated_id": eliminated_id,
+            "eliminated_name": self.get_player_name(eliminated_id) if eliminated_id else None,
+            "tie": eliminated_id is None,
+            "tally": tally,
+        }
+
+        # Check win conditions *before* broadcasting so clients get a single, final update.
+        self.winner = self._compute_winner(eliminated_id)
+        self.state = GameState.GAME_OVER if self.winner else GameState.RESULTS
         await self.broadcast_state()
-        
-        # Check Win Conditions
-        await self.check_win_condition(eliminated_id)
 
-    async def check_win_condition(self, eliminated_id):
+    def _compute_winner(self, eliminated_id: Optional[str]) -> Optional[str]:
         # 1. Imposter Eliminated -> Civilians Win
         if eliminated_id and eliminated_id == self.imposter_id:
-            self.winner = "Civilians"
-            self.state = GameState.GAME_OVER
-            await self.broadcast_state()
-            return
+            return "Civilians"
+        # 2. Imposter Survives & 1:1 Ratio (2 players left) -> Imposter Wins
+        if len(self.alive_players()) <= 2:
+            return "Imposter"
+        # Otherwise the host moves on with "Next Round"
+        return None
 
-        # 2. Imposter Survives & 1:1 Ratio -> Imposter Wins
-        alive_players = [p for p in self.players.values() if p.is_alive]
-        alive_count = len(alive_players)
-        
-        # If imposter is still alive (implicit, otherwise caught above)
-        # Ratio 1 Imposter vs 1 Civilian = 2 players total
-        if alive_count <= 2:
-            self.winner = "Imposter"
-            self.state = GameState.GAME_OVER
-            await self.broadcast_state()
-            return
-            
-        # Continue Game if no win
-        # Wait a bit then next round? Or manual trigger? 
-        # Usually automated or Host clicks "Next Round". 
-        # Let's make it Host triggered for better pacing, OR auto after 5s.
-        # For this MVP, let's keep it manual "Next Round" button for Host in RESULTS screen.
-
-    async def next_round(self):
-        # Proceed to next round with new words
+    async def next_round(self, actor_id: str) -> Optional[str]:
+        if not self.is_host(actor_id):
+            return "Only the host can start the next round."
         if self.state == GameState.RESULTS:
             await self.start_round()
+        return None
+
+    async def return_to_lobby(self, actor_id: str) -> Optional[str]:
+        """After a game ends, keep the room together and go back to the waiting room."""
+        if not self.is_host(actor_id):
+            return "Only the host can start a new game."
+        if self.state != GameState.GAME_OVER:
+            return None
+
+        # Anyone who left during the game gives up their seat now
+        for pid in [pid for pid, p in self.players.items() if not p.is_connected]:
+            del self.players[pid]
+        for p in self.players.values():
+            p.is_imposter = False
+            p.is_alive = True
+            p.voted_for = None
+            p.has_seen_imposter = False
+
+        self.state = GameState.LOBBY
+        self.imposter_id = None
+        self.winner = None
+        self.round_number = 0
+        self.last_result = None
+        self.ensure_host()
+        await self.broadcast_state()
+        return None
+
+    async def set_mystery_mode(self, actor_id: str, enabled: Any) -> Optional[str]:
+        if not self.is_host(actor_id) or self.state != GameState.LOBBY:
+            return None
+        self.mystery_mode = bool(enabled)
+        await self.broadcast_state()
+        return None
+
+    def reveal_imposter(self, actor_id: str) -> bool:
+        """Mystery Mode: an eliminated player peeks at the imposter (only for themselves)."""
+        player = self.players.get(actor_id)
+        if (
+            player
+            and not player.is_alive
+            and self.mystery_mode
+            and self.state in ACTIVE_ROUND_STATES
+            and not player.has_seen_imposter
+        ):
+            player.has_seen_imposter = True
+            return True
+        return False
 
 # --- Manager ---
 
@@ -314,49 +524,74 @@ class GameManager:
     def __init__(self):
         self.games: Dict[str, GameInstance] = {}
         self.lobby_sockets = set()
+        self._background_tasks = set()
 
     def generate_code(self):
         while True:
-            code = ''.join(random.choices(string.ascii_uppercase, k=4))
+            code = ''.join(random.choices(ROOM_CODE_ALPHABET, k=4))
             if code not in self.games:
                 return code
 
-    async def create_game(self, host_id: str, host_name: str, host_ws) -> str:
+    async def create_game(self) -> str:
         code = self.generate_code()
-        game = GameInstance(code, host_id, host_name, host_ws)
-        self.games[code] = game
-        await self.broadcast_lobby_update()
+        self.games[code] = GameInstance(code)
+        # If the creator never actually joins, don't leave a zombie room behind.
+        self.schedule_cleanup(code)
         return code
 
     def get_game(self, room_code: str) -> Optional[GameInstance]:
-        return self.games.get(room_code)
+        return self.games.get((room_code or "").upper())
+
+    def schedule_cleanup(self, room_code: str):
+        task = asyncio.create_task(self._cleanup_if_empty(room_code))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _cleanup_if_empty(self, room_code: str):
+        await asyncio.sleep(EMPTY_GAME_GRACE_SECONDS)
+        game = self.games.get(room_code)
+        if game and not game.connected_players():
+            del self.games[room_code]
+            logger.info("Removed empty room %s", room_code)
+            await self.broadcast_lobby_update()
 
     async def add_lobby_socket(self, ws):
         self.lobby_sockets.add(ws)
-    
+
     async def remove_lobby_socket(self, ws):
         self.lobby_sockets.discard(ws)
 
+    def public_game_list(self) -> List[dict]:
+        """Joinable rooms: waiting in the lobby with at least one person online."""
+        games = []
+        for g in self.games.values():
+            online = g.connected_players()
+            if g.state != GameState.LOBBY or not online:
+                continue
+            host = g.host()
+            games.append({
+                "code": g.room_code,
+                "host": host.nickname if host else online[0].nickname,
+                "count": len(online),
+                "state": g.state.value,
+                "mystery_mode": g.mystery_mode,
+            })
+        return games
+
+    async def send_game_list(self, ws):
+        await ws.send_json({"type": "gamelist", "games": self.public_game_list()})
+
     async def broadcast_lobby_update(self):
         """Sends list of active games to lobby waiters."""
-        game_list = [
-            {
-                "code": g.room_code,
-                "host": g.players[list(g.players.keys())[0]].nickname, # Use first player as host roughly
-                "count": len(g.players),
-                "state": g.state.value
-            }
-            for g in self.games.values()
-            if g.state == GameState.LOBBY # Only show joinable games? Or all? Plan said "Live List" 
-        ]
-        
+        message = {"type": "gamelist", "games": self.public_game_list()}
         to_remove = []
-        for ws in self.lobby_sockets:
+        # Iterate over a snapshot: the set can change while we await sends.
+        for ws in list(self.lobby_sockets):
             try:
-                await ws.send_json({"type": "gamelist", "games": game_list})
+                await ws.send_json(message)
             except Exception:
                 to_remove.append(ws)
-        
+
         for ws in to_remove:
             self.lobby_sockets.discard(ws)
 
